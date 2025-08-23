@@ -1,0 +1,16 @@
+{
+  "cliente1": {
+    "nombre_real": "GlobalMedia",
+    "versiones": 10,
+    "expiracion": "2025-09-19",
+    "contacto": "leo@a.com",
+    "activo": true
+  },
+  "cliente26": {
+    "nombre_real": "Noticias",
+    "versiones": 20,
+    "expiracion": "2025-09-19",
+    "contacto": "adriana.gomez@gmnet.com.mx",
+    "activo": true
+  }
+}

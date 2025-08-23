@@ -1,0 +1,5 @@
+Testigo extraído de: cliente24_ejemplo.txt
+Cliente: cliente24_ejemplo.txt
+Hora: 2025-08-20 17:19:41.928744
+Duración: 10 segundos
+Timestamp: 3317s
