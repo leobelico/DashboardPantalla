@@ -16,6 +16,13 @@ import random
 import shutil
 from collections import defaultdict
 import subprocess
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib import colors
+from reportlab.lib.units import inch
 
 # --------------------------
 # 1️⃣ Configuración inicial
@@ -32,6 +39,14 @@ CONFIG_FILE = 'clientes_config.json'
 # Carpeta para testigos
 TESTIGOS_FOLDER = 'testigos'
 os.makedirs(TESTIGOS_FOLDER, exist_ok=True)
+
+# Carpeta para CSV con fecha
+CSV_FOLDER = 'csv'
+os.makedirs(CSV_FOLDER, exist_ok=True)
+
+# Carpeta para contratos
+CONTRATOS_FOLDER = 'contratos'
+os.makedirs(CONTRATOS_FOLDER, exist_ok=True)
 
 # --------------------------
 # 2️⃣ Funciones para gestión de configuración
@@ -70,15 +85,41 @@ def obtener_info_cliente(cliente_id):
 # --------------------------
 # 3️⃣ Funciones para procesamiento de datos
 # --------------------------
-def cargar_datos():
-    """Cargar todos los archivos CSV de la carpeta data"""
+def cargar_datos(rango_fechas=None):
+    """Cargar todos los archivos CSV de la carpeta csv, opcionalmente filtrando por rango de fechas"""
     datos = []
-    archivos = glob.glob('data/*.csv') + glob.glob('*.csv')
+    archivos = glob.glob(f'{CSV_FOLDER}/*.csv')
+    
+    # Si no hay archivos en la carpeta csv, buscar en la raíz (para compatibilidad)
+    if not archivos:
+        archivos = glob.glob('*.csv')
     
     for archivo in archivos:
         try:
+            # Extraer fecha del nombre del archivo
+            nombre_archivo = os.path.basename(archivo)
+            fecha_match = re.search(r'(\d{4}-\d{2}-\d{2})', nombre_archivo)
+            
+            # Si el archivo tiene fecha en el nombre, verificar si está en el rango
+            if fecha_match and rango_fechas:
+                fecha_archivo = datetime.strptime(fecha_match.group(1), '%Y-%m-%d').date()
+                fecha_inicio, fecha_fin = rango_fechas
+                
+                # Si el archivo está fuera del rango, saltarlo
+                if fecha_archivo < fecha_inicio or fecha_archivo > fecha_fin:
+                    continue
+            
             df_temp = pd.read_csv(archivo)
             df_temp['Archivo'] = os.path.basename(archivo)
+            
+            # Intentar extraer fecha del nombre del archivo para usar como fecha de reporte
+            if fecha_match:
+                df_temp['Fecha_Reporte'] = fecha_match.group(1)
+            else:
+                # Si no hay fecha en el nombre, usar la fecha de modificación
+                fecha_mod = datetime.fromtimestamp(os.path.getmtime(archivo))
+                df_temp['Fecha_Reporte'] = fecha_mod.strftime('%Y-%m-%d')
+            
             datos.append(df_temp)
         except Exception as e:
             print(f"Error cargando {archivo}: {e}")
@@ -88,7 +129,7 @@ def cargar_datos():
     else:
         return pd.DataFrame()
 
-def procesar_datos(df):
+def procesar_datos(df, rango_fechas=None):
     """Procesar los datos para el dashboard"""
     if df.empty:
         return (
@@ -104,6 +145,17 @@ def procesar_datos(df):
             pd.DataFrame(columns=['Cliente', 'Total Segundos']),
             pd.DataFrame(columns=['Cliente', 'Nombre Real', 'Expiración', 'Días Restantes', 'Estado', 'Contacto'])
         )
+    
+    # Filtrar por rango de fechas si se especifica
+    if rango_fechas:
+        fecha_inicio, fecha_fin = rango_fechas
+        # Convertir a datetime para comparación
+        fecha_inicio = pd.to_datetime(fecha_inicio)
+        fecha_fin = pd.to_datetime(fecha_fin) + timedelta(days=1)  # Incluir el día completo
+        
+        # Filtrar datos
+        df = df[(pd.to_datetime(df['Playback Date']) >= fecha_inicio) & 
+                (pd.to_datetime(df['Playback Date']) < fecha_fin)]
     
     # Convertir fechas a datetime
     df['Reported Date'] = pd.to_datetime(df['Reported Date'])
@@ -270,11 +322,124 @@ def exportar_testigos_cliente(cliente_id, cantidad=3):
     
     return testigos_exportados
 
+# --------------------------
+# 5️⃣ Funciones para generar contratos PDF
+# --------------------------
+def generar_contrato_pdf(datos_contrato, output_path):
+    """Generar un contrato en formato PDF basado en el documento proporcionado"""
+    doc = SimpleDocTemplate(output_path, pagesize=letter,
+                        rightMargin=72, leftMargin=72,
+                        topMargin=72, bottomMargin=18)
+    
+    styles = getSampleStyleSheet()
+    elements = []
+    
+    # Encabezado
+    elements.append(Paragraph("Grandes Redes S.A. de C.V.", styles['Title']))
+    elements.append(Paragraph("Av. Salvador Nava Martinez #278, Col. El Paseo 78320 S.L.P.", styles['Normal']))
+    elements.append(Spacer(1, 12))
+    
+    # Datos del Cliente
+    elements.append(Paragraph("Datos del Cliente", styles['Heading2']))
+    
+    # Tabla de datos del cliente
+    cliente_data = [
+        ['Nombre:', datos_contrato['nombre_cliente'], 'R.F.C.:', datos_contrato['rfc']],
+        ['Domicilio:', datos_contrato['domicilio'], '', ''],
+        ['Correo, Teléfono, Fax:', datos_contrato['contacto'], '', ''],
+        ['Fecha:', datos_contrato['fecha_contrato'], 'N° de Orden:', datos_contrato['numero_orden']],
+        ['Cliente Nuevo:', datos_contrato['cliente_nuevo'], 'Empresa:', datos_contrato['empresa']],
+        ['Tiempo de Duración:', datos_contrato['duracion'], 'N° de Versiones:', datos_contrato['versiones']]
+    ]
+    
+    cliente_table = Table(cliente_data, colWidths=[1.5*inch, 2.5*inch, 1*inch, 2*inch])
+    cliente_table.setStyle(TableStyle([
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('SPAN', (1, 1), (3, 1)),
+        ('SPAN', (1, 2), (3, 2)),
+    ]))
+    
+    elements.append(cliente_table)
+    elements.append(Spacer(1, 12))
+    
+    # Detalles de la Campaña
+    elements.append(Paragraph("Detalles de la Campaña", styles['Heading2']))
+    
+    campana_data = [
+        ['Diseño', 'Descripción del contenido', 'Duración y vigencia', 'Frecuencia de proyección', 'Horario / Programa', 'Formato Entregado', 'Precio Base', 'Descuento aplicado', 'IVA', 'Total'],
+        [
+            datos_contrato['diseno'], 
+            datos_contrato['descripcion_contenido'], 
+            datos_contrato['duracion_vigencia'], 
+            datos_contrato['frecuencia_proyeccion'], 
+            datos_contrato['horario_programa'], 
+            datos_contrato['formato_entregado'], 
+            datos_contrato['precio_base'], 
+            datos_contrato['descuento'], 
+            datos_contrato['iva'], 
+            datos_contrato['total']
+        ]
+    ]
+    
+    campana_table = Table(campana_data, colWidths=[0.7*inch]*10)
+    campana_table.setStyle(TableStyle([
+        ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
+        ('FONTSIZE', (0, 0), (-1, -1), 6),
+    ]))
+    
+    elements.append(campana_table)
+    elements.append(Spacer(1, 12))
+    
+    # Información adicional
+    elements.append(Paragraph("En caso de requerir diseño por parte de la empresa, mandar logotipo, corpus gráfico del producto o servicio que se ofrece, una imagen en formato JPG o PNG con calidad de 300 pixeles, slogan y breve presentación para proyectar la idea visual correctamente. El material deberá enviarse a: roberto.sanchez@gmnet.mx, martin.davila@gmnet.mx, ventas", styles['Normal']))
+    elements.append(Spacer(1, 12))
+    
+    # Condiciones Generales
+    elements.append(Paragraph("Condiciones Generales", styles['Heading2']))
+    condiciones = [
+        "1. El Cliente entregará contenido en tiempo y forma según especificaciones técnicas.",
+        "2. El Prestador garantizará proyección en condiciones óptimas.",
+        "3. Todo material deberá respetar derechos de autor e imagen.",
+        "4. El pago se realizará conforme a lo estipulado en la orden.",
+        "5. Cancelaciones/modificaciones con mínimo 24 hrs de anticipación."
+    ]
+    
+    for condicion in condiciones:
+        elements.append(Paragraph(condicion, styles['Normal']))
+    
+    elements.append(Spacer(1, 12))
+    
+    # Firmas
+    firmas_data = [
+        ['_________________________', '_________________________', '_________________________'],
+        ['Cliente', 'Gerencia de Ventas', 'Credito y Cobranza']
+    ]
+    
+    firmas_table = Table(firmas_data, colWidths=[2.5*inch, 2.5*inch, 2.5*inch])
+    elements.append(firmas_table)
+    elements.append(Spacer(1, 12))
+    
+    # Texto adicional
+    texto_adicional = "Por medio del presente pagaré, me comprometo incondicionalmente a liquidar la cantidad total de este contrato; sujeto a la cantidad de meses de transmisión requeridos y de acuerdo al importe del plan de publicidad seleccionado, cumpliendo el plazo de pago en los días de crédito marcados en este contrato. Las cancelaciones o modificaciones especiales, se aceptarán con un mínimo de 24 horas."
+    elements.append(Paragraph(texto_adicional, styles['Normal']))
+    elements.append(Spacer(1, 12))
+    
+    # Ficha Técnica
+    elements.append(Paragraph("Ficha Tecnica.", styles['Heading2']))
+    ficha_tecnica = "Resolución de 1320 x 840 pixeles, el formato de cointenido, video (reel) mp4, mov, en caso de imagen estatica: JPG o PNG, video con duración de 6 seg. hasta 20 versiones, área segura de diseño 1200x760 pixeles (para elemntos importantes). Texto legible a distancia, evitar frames neegros al inicio o final del video. codificación del video H.264/H.265. Peso maximo recomendado, video: 50 MB, imagen 10MB"
+    elements.append(Paragraph(ficha_tecnica, styles['Normal']))
+    
+    # Construir el PDF
+    doc.build(elements)
+    return output_path
+
 # Cargar datos iniciales
 df, ocupacion, clientes_unicos, ingresos_totales, clientes_por_mes, clientes_nuevos_mes, ingresos_mes, campanas, frecuencia_clientes, top_clientes_reproducciones, evolucion_diaria, versiones_por_cliente, tiempo_por_cliente, estado_clientes = procesar_datos(cargar_datos())
 
 # --------------------------
-# 5️⃣ Layout del Dashboard
+# 6️⃣ Layout del Dashboard
 # --------------------------
 app.layout = dbc.Container([
     # Título y carga de archivos
@@ -309,6 +474,40 @@ app.layout = dbc.Container([
                     html.Div(id='output-data-upload'),
                 ], width=12),
             ]),
+            
+            # Selector de rango de fechas
+            dbc.Row([
+                dbc.Col([
+                    dbc.Card([
+                        dbc.CardHeader("Filtrar por Rango de Fechas"),
+                        dbc.CardBody([
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label("Fecha Inicio"),
+                                    dcc.DatePickerSingle(
+                                        id='fecha-inicio',
+                                        display_format='YYYY-MM-DD',
+                                        placeholder='Selecciona fecha inicio'
+                                    ),
+                                ], width=4),
+                                dbc.Col([
+                                    dbc.Label("Fecha Fin"),
+                                    dcc.DatePickerSingle(
+                                        id='fecha-fin',
+                                        display_format='YYYY-MM-DD',
+                                        placeholder='Selecciona fecha fin'
+                                    ),
+                                ], width=4),
+                                dbc.Col([
+                                    dbc.Label(" "),
+                                    dbc.Button("Aplicar Filtro", id='btn-filtrar-fechas', color='primary', className='mt-2'),
+                                ], width=4),
+                            ]),
+                            html.Div(id='output-filtro-fechas', className='mt-2')
+                        ])
+                    ])
+                ], width=12),
+            ], className="mb-4"),
             
             # Tarjetas de métricas
             dbc.Row([
@@ -483,16 +682,151 @@ app.layout = dbc.Container([
                 ], width=6),
             ]),
         ]),
+        
+        # Pestaña 3: Creación de Contratos
+        dbc.Tab(label="Creación de Contratos", children=[
+            dbc.Row([
+                dbc.Col([
+                    dbc.Card([
+                        dbc.CardHeader("Datos del Contrato"),
+                        dbc.CardBody([
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label("Nombre del Cliente"),
+                                    dbc.Input(id='contrato-nombre', type='text', placeholder='Nombre completo del cliente'),
+                                ], width=6),
+                                dbc.Col([
+                                    dbc.Label("RFC"),
+                                    dbc.Input(id='contrato-rfc', type='text', placeholder='RFC del cliente'),
+                                ], width=6),
+                            ]),
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label("Domicilio"),
+                                    dbc.Input(id='contrato-domicilio', type='text', placeholder='Domicilio completo'),
+                                ], width=12),
+                            ], className='mt-3'),
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label("Correo, Teléfono, Fax"),
+                                    dbc.Input(id='contrato-contacto', type='text', placeholder='Información de contacto'),
+                                ], width=12),
+                            ], className='mt-3'),
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label("Fecha de Contrato"),
+                                    dcc.DatePickerSingle(
+                                        id='contrato-fecha',
+                                        date=datetime.now().date(),
+                                        display_format='YYYY-MM-DD'
+                                    ),
+                                ], width=4),
+                                dbc.Col([
+                                    dbc.Label("N° de Orden"),
+                                    dbc.Input(id='contrato-numero-orden', type='text', placeholder='Número de orden'),
+                                ], width=4),
+                                dbc.Col([
+                                    dbc.Label("Empresa"),
+                                    dbc.Input(id='contrato-empresa', type='text', placeholder='Nombre de la empresa'),
+                                ], width=4),
+                            ], className='mt-3'),
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label("Cliente Nuevo"),
+                                    dbc.Select(
+                                        id='contrato-cliente-nuevo',
+                                        options=[
+                                            {'label': 'Sí', 'value': 'Sí'},
+                                            {'label': 'No', 'value': 'No'}
+                                        ],
+                                        value='Sí'
+                                    ),
+                                ], width=4),
+                                dbc.Col([
+                                    dbc.Label("Tiempo de Duración"),
+                                    dbc.Input(id='contrato-duracion', type='text', placeholder='Ej: 4 semanas'),
+                                ], width=4),
+                                dbc.Col([
+                                    dbc.Label("N° de Versiones"),
+                                    dbc.Input(id='contrato-versiones', type='number', value=1, min=1),
+                                ], width=4),
+                            ], className='mt-3'),
+                        ])
+                    ])
+                ], width=6),
+                
+                dbc.Col([
+                    dbc.Card([
+                        dbc.CardHeader("Detalles de la Campaña"),
+                        dbc.CardBody([
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label("Diseño"),
+                                    dbc.Input(id='contrato-diseno', type='text', placeholder='Ej: Cliente / Prestador'),
+                                ], width=6),
+                                dbc.Col([
+                                    dbc.Label("Descripción del contenido"),
+                                    dbc.Input(id='contrato-descripcion', type='text', placeholder='Ej: Video 6 seg. / Imagen estática'),
+                                ], width=6),
+                            ]),
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label("Duración y vigencia"),
+                                    dbc.Input(id='contrato-vigencia', type='text', placeholder='Ej: 4 semanas, Inicio: 01/01/2023, Fin: 28/01/2023'),
+                                ], width=12),
+                            ], className='mt-3'),
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label("Frecuencia de proyección"),
+                                    dbc.Input(id='contrato-frecuencia', type='text', placeholder='Ej: 10 veces/día (6 seg. c/u)'),
+                                ], width=6),
+                                dbc.Col([
+                                    dbc.Label("Horario / Programa"),
+                                    dbc.Input(id='contrato-horario', type='text', placeholder='Ej: 08:00 am -- 10:00 pm'),
+                                ], width=6),
+                            ], className='mt-3'),
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label("Formato Entregado"),
+                                    dbc.Input(id='contrato-formato', type='text', placeholder='Ej: MP4 / JPG / PNG'),
+                                ], width=4),
+                                dbc.Col([
+                                    dbc.Label("Precio Base ($)"),
+                                    dbc.Input(id='contrato-precio', type='number', value=0, min=0),
+                                ], width=4),
+                                dbc.Col([
+                                    dbc.Label("Descuento aplicado (%)"),
+                                    dbc.Input(id='contrato-descuento', type='number', value=0, min=0, max=100),
+                                ], width=4),
+                            ], className='mt-3'),
+                            dbc.Row([
+                                dbc.Col([
+                                    dbc.Label("IVA ($)"),
+                                    dbc.Input(id='contrato-iva', type='number', value=0, min=0),
+                                ], width=6),
+                                dbc.Col([
+                                    dbc.Label("Total ($)"),
+                                    dbc.Input(id='contrato-total', type='number', value=0, min=0),
+                                ], width=6),
+                            ], className='mt-3'),
+                            dbc.Button("Generar Contrato PDF", id='btn-generar-contrato', color='success', className='mt-3'),
+                            html.Div(id='output-contrato', className='mt-2')
+                        ])
+                    ])
+                ], width=6),
+            ]),
+        ]),
     ]),
     
     # Almacenamiento de datos
     dcc.Store(id='stored-data', data=df.to_dict('records')),
     dcc.Store(id='stored-config', data=cargar_configuracion()),
+    dcc.Store(id='stored-fechas', data={'inicio': None, 'fin': None}),
     
 ], fluid=True)
 
 # --------------------------
-# 6️⃣ Callbacks para actualizar datos
+# 7️⃣ Callbacks para actualizar datos
 # --------------------------
 def parse_contents(contents, filename):
     """Parsear el contenido del archivo subido"""
@@ -508,11 +842,14 @@ def parse_contents(contents, filename):
         print(e)
         return html.Div(['Hubo un error procesando el archivo'])
     
-    # Guardar el archivo
-    os.makedirs('data', exist_ok=True)
-    df.to_csv(f'data/{filename}', index=False)
+    # Guardar el archivo con fecha actual en la carpeta csv
+    fecha_actual = datetime.now().strftime('%Y-%m-%d')
+    nombre_archivo = f"{fecha_actual}_{filename}"
+    ruta_archivo = os.path.join(CSV_FOLDER, nombre_archivo)
     
-    return html.Div([f'Archivo {filename} cargado correctamente!'])
+    df.to_csv(ruta_archivo, index=False)
+    
+    return html.Div([f'Archivo {filename} guardado como {nombre_archivo}!'])
 
 def crear_tabla_estado_clientes(estado_clientes):
     """Crear tabla HTML con estado de clientes y botones de testigos"""
@@ -609,28 +946,50 @@ def crear_tabla_clientes_config():
      Output('graph-ingresos-mes', 'figure'),
      Output('graph-top-clientes', 'figure'),
      Output('graph-tiempo-cliente', 'figure'),
-     Output('graph-evolucion-diaria', 'figure')],
+     Output('graph-evolucion-diaria', 'figure'),
+     Output('output-filtro-fechas', 'children')],
     [Input('upload-data', 'contents'),
+     Input('btn-filtrar-fechas', 'n_clicks'),
      Input('stored-config', 'data')],
     [State('upload-data', 'filename'),
-     State('stored-data', 'data')],
+     State('stored-data', 'data'),
+     State('fecha-inicio', 'date'),
+     State('fecha-fin', 'date'),
+     State('stored-fechas', 'data')],
     prevent_initial_call=False
 )
-def update_data(contents, config_data, filenames, stored_data):
-    """Actualizar los datos cuando se sube un nuevo archivo o cambia la configuración"""
+def update_data(contents, n_clicks_filtro, config_data, filenames, stored_data, fecha_inicio, fecha_fin, fechas_actuales):
+    """Actualizar los datos cuando se sube un nuevo archivo, cambia la configuración o se aplica filtro de fechas"""
+    
+    ctx = callback_context
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
     
     # Si se subió un nuevo archivo
-    if contents is not None:
+    if contents is not None and trigger_id == 'upload-data':
         for content, filename in zip(contents, filenames):
-            parse_contents(content, filename)
+            resultado_upload = parse_contents(content, filename)
+    
+    # Determinar rango de fechas a usar
+    rango_fechas = None
+    mensaje_filtro = ""
+    
+    # Si se hizo clic en el botón de filtrar
+    if trigger_id == 'btn-filtrar-fechas' and fecha_inicio and fecha_fin:
+        rango_fechas = (pd.to_datetime(fecha_inicio).date(), pd.to_datetime(fecha_fin).date())
+        mensaje_filtro = f"Filtro aplicado: {fecha_inicio} a {fecha_fin}"
+    # Si hay fechas almacenadas
+    elif fechas_actuales and fechas_actuales['inicio'] and fechas_actuales['fin']:
+        rango_fechas = (pd.to_datetime(fechas_actuales['inicio']).date(), 
+                        pd.to_datetime(fechas_actuales['fin']).date())
+        mensaje_filtro = f"Filtro aplicado: {fechas_actuales['inicio']} a {fechas_actuales['fin']}"
     
     # Recargar y procesar datos
-    df = cargar_datos()
+    df = cargar_datos(rango_fechas)
     (df_processed, ocupacion, clientes_unicos, ingresos_totales, 
      clientes_por_mes, clientes_nuevos_mes, ingresos_mes, 
      campanas, frecuencia_clientes, top_clientes_reproducciones, 
      evolucion_diaria, versiones_por_cliente, tiempo_por_cliente,
-     estado_clientes) = procesar_datos(df)
+     estado_clientes) = procesar_datos(df, rango_fechas)
     
     # Actualizar métricas
     metric_clientes = f"{clientes_unicos}"
@@ -682,14 +1041,32 @@ def update_data(contents, config_data, filenames, stored_data):
         fig_evolucion_diaria = go.Figure()
         fig_evolucion_diaria.update_layout(title="Reproducciones por Día")
     
+    # Mensaje de upload si corresponde
+    mensaje_upload = html.Div([f"Datos actualizados. {len(df_processed)} registros de {clientes_unicos} clientes."])
+    if contents is not None and trigger_id == 'upload-data':
+        mensaje_upload = resultado_upload
+    
     return (
         df_processed.to_dict('records'), 
-        html.Div([f"Datos actualizados. {len(df_processed)} registros de {clientes_unicos} clientes."]),
+        mensaje_upload,
         metric_clientes, metric_ingresos, metric_reproducciones, metric_horas,
         tabla_estado,
         fig_clientes_mes, fig_ingresos_mes, fig_top_clientes, 
-        fig_tiempo_cliente, fig_evolucion_diaria
+        fig_tiempo_cliente, fig_evolucion_diaria,
+        html.Div(mensaje_filtro, style={'color': 'green'}) if mensaje_filtro else html.Div("Sin filtro de fechas")
     )
+
+@app.callback(
+    Output('stored-fechas', 'data'),
+    [Input('btn-filtrar-fechas', 'n_clicks')],
+    [State('fecha-inicio', 'date'),
+     State('fecha-fin', 'date')]
+)
+def actualizar_fechas_almacenadas(n_clicks, fecha_inicio, fecha_fin):
+    """Almacenar las fechas de filtro seleccionadas"""
+    if n_clicks:
+        return {'inicio': fecha_inicio, 'fin': fecha_fin}
+    return no_update
 
 @app.callback(
     [Output('output-guardar-cliente', 'children'),
@@ -777,12 +1154,106 @@ def exportar_testigos(n_clicks, ids):
             html.P("Asegúrate de tener los videos en la carpeta 'videos'")
         ])
 
+@app.callback(
+    [Output('output-contrato', 'children'),
+     Output('contrato-total', 'value')],
+    [Input('btn-generar-contrato', 'n_clicks'),
+     Input('contrato-precio', 'value'),
+     Input('contrato-descuento', 'value'),
+     Input('contrato-iva', 'value')],
+    [State('contrato-nombre', 'value'),
+     State('contrato-rfc', 'value'),
+     State('contrato-domicilio', 'value'),
+     State('contrato-contacto', 'value'),
+     State('contrato-fecha', 'date'),
+     State('contrato-numero-orden', 'value'),
+     State('contrato-empresa', 'value'),
+     State('contrato-cliente-nuevo', 'value'),
+     State('contrato-duracion', 'value'),
+     State('contrato-versiones', 'value'),
+     State('contrato-diseno', 'value'),
+     State('contrato-descripcion', 'value'),
+     State('contrato-vigencia', 'value'),
+     State('contrato-frecuencia', 'value'),
+     State('contrato-horario', 'value'),
+     State('contrato-formato', 'value')]
+)
+def generar_contrato(n_clicks, precio, descuento, iva, nombre, rfc, domicilio, contacto, fecha, 
+                    numero_orden, empresa, cliente_nuevo, duracion, versiones, diseno, descripcion, 
+                    vigencia, frecuencia, horario, formato):
+    """Generar contrato PDF cuando se hace clic en el botón"""
+    if n_clicks is None:
+        return no_update, no_update
+    
+    # Calcular total automáticamente si no se ha especificado
+    if precio is not None and descuento is not None and iva is not None:
+        descuento_valor = precio * (descuento / 100)
+        total = precio - descuento_valor + iva
+    else:
+        total = 0
+    
+    # Si se está calculando automáticamente, solo actualizar el total
+    ctx = callback_context
+    trigger_id = ctx.triggered[0]['prop_id'].split('.')[0] if ctx.triggered else None
+    
+    if trigger_id != 'btn-generar-contrato':
+        return no_update, total
+    
+    # Validar campos obligatorios
+    if not all([nombre, rfc, domicilio, contacto, fecha, numero_orden]):
+        return html.Div("❌ Por favor complete todos los campos obligatorios", style={'color': 'red'}), total
+    
+    # Preparar datos para el contrato
+    datos_contrato = {
+        'nombre_cliente': nombre or '',
+        'rfc': rfc or '',
+        'domicilio': domicilio or '',
+        'contacto': contacto or '',
+        'fecha_contrato': fecha or datetime.now().strftime('%Y-%m-%d'),
+        'numero_orden': numero_orden or '',
+        'empresa': empresa or '',
+        'cliente_nuevo': cliente_nuevo or 'Sí',
+        'duracion': duracion or '',
+        'versiones': str(versiones or '1'),
+        'diseno': diseno or '',
+        'descripcion_contenido': descripcion or '',
+        'duracion_vigencia': vigencia or '',
+        'frecuencia_proyeccion': frecuencia or '',
+        'horario_programa': horario or '',
+        'formato_entregado': formato or '',
+        'precio_base': f"${precio or 0:,.2f}",
+        'descuento': f"{descuento or 0}%",
+        'iva': f"${iva or 0:,.2f}",
+        'total': f"${total:,.2f}"
+    }
+    
+    # Generar nombre del archivo
+    nombre_archivo = f"contrato_{nombre.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    ruta_archivo = os.path.join(CONTRATOS_FOLDER, nombre_archivo)
+    
+    try:
+        # Generar el PDF
+        generar_contrato_pdf(datos_contrato, ruta_archivo)
+        
+        return html.Div([
+            html.P("✅ Contrato generado correctamente", style={'color': 'green'}),
+            html.P(f"Archivo: {nombre_archivo}"),
+            html.A("Descargar contrato", href=f"/assets/contratos/{nombre_archivo}", target="_blank")
+        ]), total
+    except Exception as e:
+        return html.Div(f"❌ Error al generar el contrato: {str(e)}", style={'color': 'red'}), total
+
 # --------------------------
-# 7️⃣ Ejecutar servidor
+# 8️⃣ Ejecutar servidor
 # --------------------------
 if __name__ == '__main__':
     os.makedirs('data', exist_ok=True)
     os.makedirs('testigos', exist_ok=True)
     os.makedirs('videos', exist_ok=True)
+    os.makedirs('csv', exist_ok=True)
+    os.makedirs('contratos', exist_ok=True)
+    
+    # Crear carpeta assets para servir archivos estáticos
+    os.makedirs('assets/contratos', exist_ok=True)
     
     app.run(debug=True)
